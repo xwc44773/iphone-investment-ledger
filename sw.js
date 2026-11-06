@@ -1,4 +1,4 @@
-const VERSION='phone-ledger-shell-1.0.3';
+const VERSION='phone-ledger-shell-1.0.4';
 const FILES=['./','./index.html','./style.css','./app.js','./core.js','./db.js','./manifest.webmanifest','./icons/apple-touch-icon.png','./icons/icon-192.png','./icons/icon-512.png','./icons/icon.svg'];
 self.addEventListener('install',event=>event.waitUntil(caches.open(VERSION).then(cache=>cache.addAll(FILES))));
 // Activate only when old windows close; do not mix an open old UI with new code.
