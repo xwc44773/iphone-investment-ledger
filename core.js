@@ -19,9 +19,47 @@ export function wallet(s,asOf=today()){
  }return [...lots.values()].filter(l=>l.amount>0)
 }
 export function take(s,source,value,date){let left=amount(value);const uses=[];for(const l of wallet(s,date).filter(l=>l.source===source)){const n=Math.min(left,l.amount);if(n){uses.push({lotId:l.id,amount:n});left-=n}if(!left)break}if(left)throw Error(({principal:'收回的本金',profit:'收到的收益',own:'已确认可用余额'})[source]+'不足，不能提前使用或重复使用');return uses}
+export function remainingPrincipal(s,b,date=today()){
+ const returns=s.events.filter(e=>e.batchId===b.id&&e.date<=date);
+ if(returns.some(e=>e.role==='release'))return 0;
+ return b.principal-returns.filter(e=>e.role==='partial').reduce((sum,e)=>sum+e.amount,0)
+}
+export function partialReturn(s,id,value,date,at=today()){
+ const b=s.batches.find(b=>b.id===id);
+ if(!b||!amount(value)||value>=remainingPrincipal(s,b,at))throw Error('部分收回金额需大于零且小于剩余本金；全部收到请选择结清');
+ const n=clone(s);
+ n.events.push({id:uid(),batchId:id,role:'partial',type:'credit',source:'principal',amount:value,date});
+ return commit(s,n,'部分收回本金',at)
+}
+export function correctPartial(s,id,value,date,at=today()){
+ const n=clone(s),event=n.events.find(e=>e.id===id&&e.role==='partial');
+ if(!event)throw Error('找不到这笔部分收回记录');
+ n.audit.push({id:uid(),date:at,action:'更正前部分收回记录',before:clone(event)});
+ event.amount=amount(value);event.date=date;
+ return commit(s,n,'更正部分收回本金',at)
+}
+export function undoRecord(s,id,at=today()){
+ const n=clone(s),batch=n.batches.find(b=>b.id===id),event=n.events.find(e=>e.id===id);
+ let removed;
+ if(batch){
+  removed=n.events.filter(e=>e.batchId===id);
+  if(removed.some(e=>!['external','funding'].includes(e.role)))throw Error('请先撤销这笔投资已记录的分红或本金收回');
+  n.batches=n.batches.filter(b=>b.id!==id);
+ }else{
+  if(!event||!['receipt','release','partial','repayment','expense'].includes(event.role))throw Error('找不到可撤销的记录');
+  if(event.role==='partial'&&n.events.some(e=>e.batchId===event.batchId&&e.role==='release'))throw Error('请先撤销本笔投资的最终结清记录');
+  removed=n.events.filter(e=>e.id===id||e.id==='external:'+id);
+ }
+ const ids=new Set(removed.map(e=>e.id));
+ n.events=n.events.filter(e=>!ids.has(e.id));
+ const dependent=n.events.find(e=>e.uses?.some(u=>ids.has(u.lotId)));
+ if(dependent)throw Error('这笔钱已用于'+(n.batches.find(b=>b.id===dependent.batchId)?.name||({expense:'生活支出',repayment:'还款'}[dependent.role]||'其他记录'))+'，请先更正关联记录');
+ n.audit.push({id:uid(),date:at,action:'撤销前记录',batch,events:removed});
+ return commit(s,n,'撤销误记',at)
+}
 export function summary(s,date=today()){
- const lots=wallet(s,date),cash=lots.reduce((a,l)=>a+l.amount,0),batches=s.batches.filter(b=>b.date<=date&&!s.events.some(e=>e.role==='release'&&e.batchId===b.id&&e.date<=date));
- const invested=batches.reduce((a,b)=>a+b.principal,0),profit=s.events.filter(e=>e.role==='receipt'&&e.date<=date).reduce((a,e)=>a+e.amount,0);
+ const lots=wallet(s,date),cash=lots.reduce((a,l)=>a+l.amount,0),batches=s.batches.filter(b=>b.date<=date&&remainingPrincipal(s,b,date)>0);
+ const invested=batches.reduce((a,b)=>a+remainingPrincipal(s,b,date),0),profit=s.events.filter(e=>e.role==='receipt'&&e.date<=date).reduce((a,e)=>a+e.amount,0);
  const debts=s.debts.filter(d=>d.date<=date).map(d=>({...d,balance:d.initial-s.events.filter(e=>e.debtId===d.id&&e.role==='repayment'&&e.date<=date).reduce((a,e)=>a+e.amount,0)}));
  return {lots,cash,invested,profit,pool:invested+cash,batches,debts,debt:debts.length?debts.reduce((a,d)=>a+d.balance,0):null,percent:Math.min(100,Number(BigInt(invested+cash)*10000n/BigInt(s.target))/100)}
 }
@@ -60,7 +98,12 @@ export function validate(s,at=today()){
  if(s.events.reduce((n,e)=>n+BigInt(amount(e.amount)),0n)>9000000000000n)throw Error('累计金额超出安全记录范围');
  const ids=new Set();for(const o of [...s.batches,...s.events,...s.debts,...s.plans,...s.audit]){if(typeof o.id!=='string'||!o.id||ids.has(o.id))throw Error('记录编号重复或缺失');ids.add(o.id)}
  for(const b of s.batches){amount(b.principal);day(b.date);day(b.start);day(b.end);if(b.date>at||b.start<b.date||b.end<b.start||b.principal<500000||b.principal%500000)throw Error('投资金额或日期不正确');if(b.expected!=null)amount(b.expected);if(b.expectedDate&&day(b.expectedDate)<b.date)throw Error('预计日期不正确');if(Object.values(b.funding).reduce((a,v)=>a+amount(v),0)!==b.principal)throw Error('投资来源合计不一致');const f=s.events.filter(e=>e.role==='funding'&&e.batchId===b.id);if(f.length!==1||f[0].amount!==b.principal||f[0].date!==b.date)throw Error('投资资金关联不完整');if(Object.keys(b.funding).some(k=>!['newOwn','own','principal','profit'].includes(k)))throw Error('投资来源类型不正确');const external=s.events.filter(e=>e.role==='external'&&e.batchId===b.id);if(b.funding.newOwn?external.length!==1||external[0].id!=='external:'+b.id||external[0].amount!==b.funding.newOwn||external[0].date!==b.date:external.length)throw Error('新增自有资金关联不一致');const used={own:0,principal:0,profit:0};for(const u of f[0].uses||[]){const credit=s.events.find(e=>e.id===u.lotId&&e.type==='credit');if(!credit||!(credit.source in used))throw Error('投资来源关联不存在');used[credit.source]+=amount(u.amount)}if(used.own!==(b.funding.newOwn||0)+(b.funding.own||0)||used.principal!==(b.funding.principal||0)||used.profit!==(b.funding.profit||0))throw Error('投资来源拆分与实际资金使用不一致')}
- for(const e of s.events){amount(e.amount);checkDate(e.date,at);if(e.batchId&&!s.batches.some(b=>b.id===e.batchId&&e.date>=b.date))throw Error('资金事件关联错误');if(e.type==='credit'){if(!['own','profit','principal'].includes(e.source)||!['external','receipt','release'].includes(e.role))throw Error('入账类型错误');if(e.source!==({external:'own',receipt:'profit',release:'principal'})[e.role])throw Error('资金来源类别与事件不一致');if(e.role!=='external'&&(!e.batchId||e.id!==e.role+':'+e.batchId))throw Error('到账记录重复或关联不正确')}else if(e.type==='debit'){if(!['funding','expense','repayment'].includes(e.role)||!Array.isArray(e.uses)||!e.uses.length)throw Error('资金用途错误');if(new Set(e.uses.map(u=>u.lotId)).size!==e.uses.length)throw Error('同一资金被重复引用');if(e.uses.reduce((a,u)=>a+amount(u.amount),0)!==e.amount)throw Error('资金使用合计不一致');if(e.role==='funding'&&(!e.batchId||e.id!=='funding:'+e.batchId))throw Error('投资资金缺少正确关联');if(e.role==='repayment'&&!s.debts.some(d=>d.id===e.debtId))throw Error('还款缺少债务关联')}else throw Error('资金事件类型错误')}
+ for(const e of s.events){amount(e.amount);checkDate(e.date,at);if(e.batchId&&!s.batches.some(b=>b.id===e.batchId&&e.date>=b.date))throw Error('资金事件关联错误');if(e.type==='credit'){if(!['own','profit','principal'].includes(e.source)||!['external','receipt','release','partial'].includes(e.role))throw Error('入账类型错误');if(e.source!==({external:'own',receipt:'profit',release:'principal',partial:'principal'})[e.role])throw Error('资金来源类别与事件不一致');if(e.role==='partial'&&(!e.batchId||!e.amount))throw Error('部分收回记录无效');if(!['partial','external'].includes(e.role)&&(!e.batchId||e.id!==e.role+':'+e.batchId))throw Error('到账记录重复或关联不正确')}else if(e.type==='debit'){if(!['funding','expense','repayment'].includes(e.role)||!Array.isArray(e.uses)||!e.uses.length)throw Error('资金用途错误');if(new Set(e.uses.map(u=>u.lotId)).size!==e.uses.length)throw Error('同一资金被重复引用');if(e.uses.reduce((a,u)=>a+amount(u.amount),0)!==e.amount)throw Error('资金使用合计不一致');if(e.role==='funding'&&(!e.batchId||e.id!=='funding:'+e.batchId))throw Error('投资资金缺少正确关联');if(e.role==='repayment'&&!s.debts.some(d=>d.id===e.debtId))throw Error('还款缺少债务关联')}else throw Error('资金事件类型错误')}
+ for(const b of s.batches){
+  const parts=s.events.filter(e=>e.batchId===b.id&&e.role==='partial');
+  const final=s.events.find(e=>e.batchId===b.id&&e.role==='release');
+  if(parts.reduce((sum,e)=>sum+e.amount,0)>=b.principal||parts.some(e=>final&&e.date>final.date))throw Error('部分收回金额或日期与剩余本金不符')
+ }
  for(const d of s.debts){amount(d.initial);amount(d.monthly);checkDate(d.date,at);if(!d.name||!Number.isInteger(d.payDay)||d.payDay<1||d.payDay>28)throw Error('债务资料不正确');if(s.events.filter(e=>e.debtId===d.id&&e.role==='repayment').reduce((a,e)=>a+e.amount,0)>d.initial)throw Error('还款超过欠款')}
  for(const p of s.plans){amount(p.principal);day(p.date);day(p.end);if(p.end<p.date||p.principal<500000||p.principal%500000)throw Error('计划资料错误');if(p.expected!=null)amount(p.expected)}
  if(!s.scenario||typeof s.scenario.enabled!=='boolean'||typeof s.scenario.debtFirst!=='boolean')throw Error('试算设置错误');if(s.scenario.days!=null&&(!Number.isInteger(s.scenario.days)||s.scenario.days<1||s.scenario.days>3650))throw Error('投资周期需为1至3650天');if(s.scenario.rate!=null)yieldAmount(10000,String(s.scenario.rate));wallet(s,at);return s
@@ -76,7 +119,7 @@ export function forecast(s,at=today()){
  const months=Array.from({length:12},(_,i)=>{const d=new Date(at.slice(0,7)+'-01T12:00:00Z');d.setUTCMonth(d.getUTCMonth()+i);return {month:d.toISOString().slice(0,7),actual:0,planned:0,simulated:0,income:0,repayment:0,required:0,total:null,gap:0,candidate:0}});
  let cash={own:0,principal:0,profit:0};for(const l of base.lots)cash[l.source]+=l.amount;let invested=base.invested;months[0].total=base.pool;const debts=base.debts.map(d=>({...d}));let payoff=debts.length&&debts.every(d=>!d.balance)?at.slice(0,7):null;
  const queue=new Map();function schedule(date,e){if(date<=at){missing.push('有逾期未确认资金，实际到账时间待核对');return}if(date.slice(0,7)>months.at(-1).month)return;if(!queue.has(date))queue.set(date,[]);queue.get(date).push(e)}
- for(const b of base.batches)schedule(addDays(b.end,1),{kind:'release',amount:b.principal});
+ for(const b of base.batches)schedule(addDays(b.end,1),{kind:'release',amount:remainingPrincipal(s,b,at)});
  for(const b of s.batches)if(!s.events.some(e=>e.role==='receipt'&&e.batchId===b.id)&&b.expected!=null){if(b.expectedDate)schedule(b.expectedDate,{kind:'profit',amount:b.expected});else missing.push('有预计收益未填写到账日，该收益未安排到具体月份')}
  for(const p of s.plans)if(p.date>at)schedule(p.date,{kind:'plan',plan:p});else missing.push('有今日或已过期投资计划待确认，请记录实际投资或取消计划');
  for(const m of months){m.actual=s.batches.filter(b=>b.date.slice(0,7)===m.month).reduce((a,b)=>a+b.principal,0)}
